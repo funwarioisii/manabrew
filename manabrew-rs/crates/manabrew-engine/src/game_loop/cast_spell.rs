@@ -2600,3 +2600,156 @@ impl GameLoop {
         }
     }
 }
+
+#[cfg(test)]
+mod field_of_the_dead_tests {
+    use super::*;
+    use crate::agent::{PassAgent, PlayCardMode};
+    use crate::card::CardInstance;
+    use forge_carddb::parse_card_script;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    fn card_script(path: &str) -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../forge/forge-gui/res")
+                .join(path),
+        )
+        .unwrap()
+    }
+
+    fn add_card(game: &mut GameState, path: &str, zone: ZoneType) -> CardId {
+        let rules = parse_card_script(&card_script(path)).unwrap();
+        let id = game.create_card(CardInstance::from_rules(&rules, PlayerId(0)));
+        game.move_card(id, zone, PlayerId(0));
+        id
+    }
+
+    fn check_land_entry(
+        already_seven: bool,
+        incoming_name: &str,
+        origin: ZoneType,
+        expected_names: usize,
+        expected_tokens: usize,
+    ) {
+        let mut game = GameState::new(&["Alice", "Bob"], 20);
+        let player = PlayerId(0);
+        game.turn.phase = PhaseType::Main1;
+        let field = add_card(
+            &mut game,
+            "cardsfolder/f/field_of_the_dead.txt",
+            ZoneType::Battlefield,
+        );
+        for name in ["forest", "island", "mountain", "plains", "swamp"] {
+            add_card(
+                &mut game,
+                &format!("cardsfolder/{}/{name}.txt", &name[..1]),
+                ZoneType::Battlefield,
+            );
+        }
+        if already_seven {
+            add_card(&mut game, "cardsfolder/w/wastes.txt", ZoneType::Battlefield);
+        }
+        if origin == ZoneType::Graveyard {
+            add_card(
+                &mut game,
+                "cardsfolder/c/crucible_of_worlds.txt",
+                ZoneType::Battlefield,
+            );
+        }
+        let incoming = add_card(
+            &mut game,
+            &format!("cardsfolder/{}/{incoming_name}.txt", &incoming_name[..1]),
+            origin,
+        );
+        let mut game_loop = GameLoop::new(2);
+        let rules = parse_card_script(&card_script("tokenscripts/b_2_2_zombie.txt")).unwrap();
+        game_loop.register_token("b_2_2_zombie", CardInstance::from_rules(&rules, player));
+        game_loop.trigger_handler.reset_active_triggers(&game);
+        crate::staticability::layer::apply_continuous_effects(&mut game);
+        assert!(
+            game_loop
+                .action_space(&game, player, true)
+                .playable
+                .iter()
+                .any(|play| play.card_id == incoming),
+            "Land must be legally playable"
+        );
+        let mut agents: Vec<Box<dyn PlayerAgent>> = vec![Box::new(PassAgent), Box::new(PassAgent)];
+        assert!(game_loop
+            .play_land(
+                &mut game,
+                &mut agents,
+                player,
+                incoming,
+                incoming_name,
+                PlayCardMode::Normal
+            )
+            .is_some());
+        assert_eq!(game.card(incoming).zone, ZoneType::Battlefield);
+        let names: BTreeSet<_> = game
+            .zone(ZoneType::Battlefield, player)
+            .cards
+            .iter()
+            .map(|id| game.card(*id))
+            .filter(|card| card.is_land())
+            .map(|card| card.card_name.as_str())
+            .collect();
+        assert_eq!(names.len(), expected_names);
+        let evaluated_names = crate::svar::resolve_count_svar(
+            game.card(field).get_s_var("X").unwrap(),
+            &game,
+            field,
+            player,
+        );
+        assert_eq!(
+            game.stack.len(),
+            expected_tokens,
+            "Field of the Dead triggers on the stack (actual distinct names: {expected_names}, evaluated X: {evaluated_names})"
+        );
+        if expected_tokens > 0 {
+            assert_eq!(game.stack.peek().unwrap().spell_ability.source, Some(field));
+            game_loop.resolve_stack(&mut game, &mut agents);
+        }
+        assert!(game.stack.is_empty());
+        let zombies = game
+            .zone(ZoneType::Battlefield, player)
+            .cards
+            .iter()
+            .map(|id| game.card(*id))
+            .filter(|card| card.is_token && card.card_name == "Zombie Token")
+            .count();
+        assert_eq!(zombies, expected_tokens);
+    }
+
+    #[test]
+    fn seventh_name_from_hand() {
+        check_land_entry(false, "wastes", ZoneType::Hand, 7, 1);
+    }
+
+    #[test]
+    fn duplicate_name_from_hand_with_seven_names() {
+        check_land_entry(true, "forest", ZoneType::Hand, 7, 1);
+    }
+
+    #[test]
+    fn duplicate_name_from_hand_with_only_six_names() {
+        check_land_entry(false, "forest", ZoneType::Hand, 6, 0);
+    }
+
+    #[test]
+    fn seventh_name_from_graveyard() {
+        check_land_entry(false, "wastes", ZoneType::Graveyard, 7, 1);
+    }
+
+    #[test]
+    fn duplicate_name_from_graveyard_with_seven_names() {
+        check_land_entry(true, "forest", ZoneType::Graveyard, 7, 1);
+    }
+
+    #[test]
+    fn duplicate_name_from_graveyard_with_only_six_names() {
+        check_land_entry(false, "forest", ZoneType::Graveyard, 6, 0);
+    }
+}
